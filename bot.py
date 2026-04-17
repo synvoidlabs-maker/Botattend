@@ -1,33 +1,33 @@
 import os
-import json
-import firebase_admin
-from firebase_admin import credentials, firestore
+import sqlite3
 from datetime import datetime, date
 from calendar import monthrange
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler,
-)
-
-# ---------- FIREBASE INIT ----------
-firebase_env = os.getenv("FIREBASE_KEY")
-
-if not firebase_env:
-    raise ValueError("❌ FIREBASE_KEY not found in ENV")
-
-firebase_key = json.loads(firebase_env)
-
-cred = credentials.Certificate(firebase_key)
-firebase_admin.initialize_app(cred)
-db = firestore.client()
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-if not TOKEN:
-    raise ValueError("❌ BOT_TOKEN not found in ENV")
+# ---------- DATABASE ----------
+conn = sqlite3.connect("data.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS attendance (
+    user TEXT,
+    day TEXT,
+    status TEXT,
+    time TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS holidays (
+    user TEXT,
+    day TEXT
+)
+""")
+
+conn.commit()
 
 # ---------- UTILS ----------
 def is_sunday(d):
@@ -42,8 +42,7 @@ async def auto_delete(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_msg(update, context, text, keyboard=None):
     msg = await update.effective_chat.send_message(text, reply_markup=keyboard)
-    if context.job_queue:
-        context.job_queue.run_once(auto_delete, 20, data=(msg.chat_id, msg.message_id))
+    context.job_queue.run_once(auto_delete, 20, data=(msg.chat_id, msg.message_id))
 
 # ---------- START ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -66,33 +65,29 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = str(date.today())
     now = datetime.now().strftime("%H:%M:%S")
 
-    doc = db.collection("users").document(user)
-    data = doc.get().to_dict() or {"records": {}, "holidays": []}
-
     # ---------- PRESENT / ABSENT ----------
     if query.data in ["present", "absent"]:
         if is_sunday(today):
             await send_msg(update, context, "❌ Sunday excluded")
             return
 
-        if today in data["records"]:
-            entry = data["records"][today]
-            await send_msg(
-                update, context,
-                f"⚠️ Already submitted ({entry['status']} at {entry['time']})"
-            )
+        cursor.execute("SELECT * FROM attendance WHERE user=? AND day=?", (user, today))
+        if cursor.fetchone():
+            await send_msg(update, context, "⚠️ Already submitted")
             return
 
-        data["records"][today] = {"status": query.data, "time": now}
-        doc.set(data)
+        cursor.execute(
+            "INSERT INTO attendance VALUES (?,?,?,?)",
+            (user, today, query.data, now)
+        )
+        conn.commit()
 
-        await send_msg(update, context, f"✅ {query.data} marked at {now}")
+        await send_msg(update, context, f"✅ {query.data} at {now}")
 
     # ---------- HOLIDAY ----------
     elif query.data == "holiday_today":
-        if today not in data["holidays"]:
-            data["holidays"].append(today)
-            doc.set(data)
+        cursor.execute("INSERT INTO holidays VALUES (?,?)", (user, today))
+        conn.commit()
 
         await send_msg(update, context, f"🎉 Holiday set ({today})")
 
@@ -108,19 +103,24 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for d in range(1, days + 1):
             d_str = f"{year}-{month:02d}-{d:02d}"
 
-            if d_str in data["records"]:
-                status = data["records"][d_str]["status"]
-                emoji = "✅" if status == "present" else "❌"
-            elif d_str in data["holidays"]:
+            cursor.execute("SELECT status FROM attendance WHERE user=? AND day=?", (user, d_str))
+            record = cursor.fetchone()
+
+            cursor.execute("SELECT * FROM holidays WHERE user=? AND day=?", (user, d_str))
+            holiday = cursor.fetchone()
+
+            if record:
+                emoji = "✅" if record[0] == "present" else "❌"
+            elif holiday:
                 emoji = "🎉"
             elif is_sunday(d_str):
                 emoji = "⛔"
             else:
                 emoji = "▫️"
 
-            row.append(
-                InlineKeyboardButton(emoji + str(d), callback_data=f"day_{d_str}")
-            )
+            row.append(InlineKeyboardButton(
+                emoji + str(d), callback_data=f"day_{d_str}"
+            ))
 
             if len(row) == 7:
                 buttons.append(row)
@@ -134,7 +134,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
-    # ---------- DATE CLICK ----------
+    # ---------- DATE ACTION ----------
     elif query.data.startswith("day_"):
         d = query.data.split("_")[1]
 
@@ -151,33 +151,38 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, action, d = query.data.split("_")
 
         if action == "holiday":
-            if d not in data["holidays"]:
-                data["holidays"].append(d)
+            cursor.execute("INSERT INTO holidays VALUES (?,?)", (user, d))
         else:
-            data["records"][d] = {"status": action, "time": now}
+            cursor.execute(
+                "INSERT OR REPLACE INTO attendance VALUES (?,?,?,?)",
+                (user, d, action, now)
+            )
 
-        doc.set(data)
-
+        conn.commit()
         await send_msg(update, context, f"✅ {action} set for {d}")
 
     # ---------- STATS ----------
     elif query.data == "stats":
+        cursor.execute("SELECT day, status FROM attendance WHERE user=?", (user,))
+        records = cursor.fetchall()
+
+        cursor.execute("SELECT day FROM holidays WHERE user=?", (user,))
+        holidays = [h[0] for h in cursor.fetchall()]
+
         total = 0
         present = 0
 
-        for d, v in data["records"].items():
-            if is_sunday(d) or d in data["holidays"]:
+        for d, status in records:
+            if is_sunday(d) or d in holidays:
                 continue
             total += 1
-            if v["status"] == "present":
+            if status == "present":
                 present += 1
 
         percent = (present / total) * 100 if total else 0
 
-        await send_msg(
-            update, context,
-            f"📊 {percent:.2f}%\nPresent: {present}/{total}"
-        )
+        await send_msg(update, context,
+            f"📊 {percent:.2f}%\nPresent: {present}/{total}")
 
 # ---------- MAIN ----------
 app = ApplicationBuilder().token(TOKEN).build()
@@ -185,5 +190,5 @@ app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(button))
 
-print("🔥 AttendX FINAL running...")
+print("🔥 AttendX SQLite Running...")
 app.run_polling()
