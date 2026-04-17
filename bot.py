@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime, date
+from calendar import monthrange
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
@@ -27,14 +28,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("✅ Present", callback_data="present")],
         [InlineKeyboardButton("❌ Absent", callback_data="absent")],
+        [InlineKeyboardButton("🎉 Holiday", callback_data="holiday_today")],
+        [InlineKeyboardButton("📅 Calendar", callback_data="calendar")],
         [InlineKeyboardButton("📊 Stats", callback_data="stats")]
     ]
+
     await update.message.reply_text(
         "📲 AttendX Panel",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# ---------- MARK ----------
+# ---------- BUTTON HANDLER ----------
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -48,126 +52,120 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user not in data:
         data[user] = {"records": {}, "holidays": []}
 
-    # Sunday check
-    if is_sunday(today):
-        await query.edit_message_text("❌ Sunday auto excluded")
-        return
-
-    # Already submitted
-    if today in data[user]["records"]:
-        entry = data[user]["records"][today]
-        await query.edit_message_text(
-            f"⚠️ Already submitted ({entry['status']} at {entry['time']})"
-        )
-        return
-
+    # ---------- PRESENT / ABSENT ----------
     if query.data in ["present", "absent"]:
-        data[user]["records"][today] = {"status": query.data, "time": now}
+        if is_sunday(today):
+            await query.edit_message_text("❌ Sunday auto excluded")
+            return
+
+        if today in data[user]["records"]:
+            entry = data[user]["records"][today]
+            await query.edit_message_text(
+                f"⚠️ Already submitted ({entry['status']} at {entry['time']})"
+            )
+            return
+
+        data[user]["records"][today] = {
+            "status": query.data,
+            "time": now
+        }
         save(data)
+
         await query.edit_message_text(f"✅ {query.data} marked at {now}")
 
-    elif query.data == "stats":
-        await stats(update, context)
-
-# ---------- EDIT ----------
-async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send date (YYYY-MM-DD)")
-
-async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = str(update.effective_user.id)
-    text = update.message.text
-
-    data = load()
-
-    if user not in data:
-        return
-
-    if "edit_date" not in context.user_data:
-        context.user_data["edit_date"] = text
-        await update.message.reply_text("Send new status (present/absent)")
-    else:
-        d = context.user_data["edit_date"]
-        status = text.lower()
-        now = datetime.now().strftime("%H:%M:%S")
-
-        data[user]["records"][d] = {"status": status, "time": now}
+    # ---------- HOLIDAY TODAY ----------
+    elif query.data == "holiday_today":
+        data[user]["holidays"].append(today)
         save(data)
 
-        context.user_data.clear()
+        await query.edit_message_text(f"🎉 Today marked holiday ({today})")
 
-        await update.message.reply_text(f"✅ Updated {d} → {status}")
+    # ---------- CALENDAR ----------
+    elif query.data == "calendar":
+        year = date.today().year
+        month = date.today().month
+        days = monthrange(year, month)[1]
 
-# ---------- HOLIDAY ----------
-async def holiday(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = str(update.effective_user.id)
-    d = context.args[0]
+        buttons = []
+        row = []
 
-    data = load()
+        for d in range(1, days + 1):
+            day_str = f"{year}-{month:02d}-{d:02d}"
+            row.append(InlineKeyboardButton(str(d), callback_data=f"day_{day_str}"))
 
-    if user not in data:
-        data[user] = {"records": {}, "holidays": []}
+            if len(row) == 7:
+                buttons.append(row)
+                row = []
 
-    data[user]["holidays"].append(d)
-    save(data)
+        if row:
+            buttons.append(row)
 
-    await update.message.reply_text(f"🎉 Holiday added: {d}")
+        await query.edit_message_text(
+            "📅 Select a date",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
 
-# ---------- STATS ----------
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = str(update.effective_user.id)
-    data = load()
+    # ---------- DATE CLICK ----------
+    elif query.data.startswith("day_"):
+        selected_date = query.data.split("_")[1]
 
-    if user not in data:
-        await update.message.reply_text("No data")
-        return
+        keyboard = [
+            [InlineKeyboardButton("✅ Present", callback_data=f"set_present_{selected_date}")],
+            [InlineKeyboardButton("❌ Absent", callback_data=f"set_absent_{selected_date}")],
+            [InlineKeyboardButton("🎉 Holiday", callback_data=f"set_holiday_{selected_date}")]
+        ]
 
-    records = data[user]["records"]
-    holidays = data[user]["holidays"]
+        await query.edit_message_text(
+            f"📅 {selected_date}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
-    total = 0
-    present = 0
+    # ---------- APPLY ACTION ----------
+    elif query.data.startswith("set_"):
+        parts = query.data.split("_")
+        action = parts[1]
+        selected_date = parts[2]
 
-    for d, v in records.items():
-        if is_sunday(d) or d in holidays:
-            continue
-        total += 1
-        if v["status"] == "present":
-            present += 1
+        if action == "holiday":
+            data[user]["holidays"].append(selected_date)
+            msg = f"🎉 Holiday set: {selected_date}"
 
-    percent = (present / total) * 100 if total else 0
+        else:
+            data[user]["records"][selected_date] = {
+                "status": action,
+                "time": now
+            }
+            msg = f"✅ {action} set for {selected_date}"
 
-    await update.message.reply_text(
-        f"📊 {percent:.2f}%\nPresent: {present}/{total}"
-    )
+        save(data)
+        await query.edit_message_text(msg)
 
-# ---------- CALENDAR ----------
-async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = str(update.effective_user.id)
-    data = load()
+    # ---------- STATS ----------
+    elif query.data == "stats":
+        records = data[user]["records"]
+        holidays = data[user]["holidays"]
 
-    if user not in data:
-        return
+        total = 0
+        present = 0
 
-    text = "📅 Calendar:\n\n"
+        for d, v in records.items():
+            if is_sunday(d) or d in holidays:
+                continue
+            total += 1
+            if v["status"] == "present":
+                present += 1
 
-    for d, v in sorted(data[user]["records"].items()):
-        emoji = "✅" if v["status"] == "present" else "❌"
-        text += f"{d} {emoji}\n"
+        percent = (present / total) * 100 if total else 0
 
-    await update.message.reply_text(text)
+        await query.edit_message_text(
+            f"📊 {percent:.2f}%\nPresent: {present}/{total}"
+        )
 
 # ---------- MAIN ----------
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(button))
-app.add_handler(CommandHandler("edit", edit))
-app.add_handler(CommandHandler("holiday", holiday))
-app.add_handler(CommandHandler("stats", stats))
-app.add_handler(CommandHandler("calendar", calendar))
-
-from telegram.ext import MessageHandler, filters
-app.add_handler(MessageHandler(filters.TEXT, handle_edit))
 
 print("🔥 AttendX Ultimate Running...")
 app.run_polling()
