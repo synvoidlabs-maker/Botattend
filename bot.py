@@ -1,4 +1,5 @@
 import os
+import json
 import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime, date
@@ -6,8 +7,9 @@ from calendar import monthrange
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# ---------- FIREBASE INIT ----------
-cred = credentials.Certificate("firebase.json")
+# ---------- FIREBASE ENV ----------
+firebase_key = json.loads(os.getenv("FIREBASE_KEY"))
+cred = credentials.Certificate(firebase_key)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
@@ -24,13 +26,9 @@ async def auto_delete(context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-async def send_auto_delete(update, context, text, keyboard=None):
-    msg = await update.effective_chat.send_message(
-        text, reply_markup=keyboard
-    )
-    context.job_queue.run_once(
-        auto_delete, 20, data=(msg.chat_id, msg.message_id)
-    )
+async def send_msg(update, context, text, keyboard=None):
+    msg = await update.effective_chat.send_message(text, reply_markup=keyboard)
+    context.job_queue.run_once(auto_delete, 20, data=(msg.chat_id, msg.message_id))
 
 # ---------- START ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -42,7 +40,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Stats", callback_data="stats")]
     ])
 
-    await send_auto_delete(update, context, "📲 AttendX Panel", keyboard)
+    await send_msg(update, context, "📲 AttendX Panel", keyboard)
 
 # ---------- BUTTON ----------
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59,24 +57,27 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---------- PRESENT / ABSENT ----------
     if query.data in ["present", "absent"]:
         if is_sunday(today):
-            await send_auto_delete(update, context, "❌ Sunday excluded")
+            await send_msg(update, context, "❌ Sunday excluded")
             return
 
         if today in data["records"]:
-            await send_auto_delete(update, context, "⚠️ Already submitted")
+            entry = data["records"][today]
+            await send_msg(update, context,
+                f"⚠️ Already submitted ({entry['status']} at {entry['time']})")
             return
 
         data["records"][today] = {"status": query.data, "time": now}
         doc.set(data)
 
-        await send_auto_delete(update, context, f"✅ {query.data} at {now}")
+        await send_msg(update, context, f"✅ {query.data} at {now}")
 
     # ---------- HOLIDAY ----------
     elif query.data == "holiday_today":
-        data["holidays"].append(today)
-        doc.set(data)
+        if today not in data["holidays"]:
+            data["holidays"].append(today)
+            doc.set(data)
 
-        await send_auto_delete(update, context, f"🎉 Holiday set ({today})")
+        await send_msg(update, context, f"🎉 Holiday set ({today})")
 
     # ---------- CALENDAR ----------
     elif query.data == "calendar":
@@ -100,7 +101,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 emoji = "▫️"
 
-            row.append(InlineKeyboardButton(emoji+str(d), callback_data=f"day_{d_str}"))
+            row.append(InlineKeyboardButton(
+                emoji + str(d), callback_data=f"day_{d_str}"
+            ))
 
             if len(row) == 7:
                 buttons.append(row)
@@ -114,7 +117,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
-    # ---------- DATE ACTION ----------
+    # ---------- DATE CLICK ----------
     elif query.data.startswith("day_"):
         d = query.data.split("_")[1]
 
@@ -131,13 +134,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, action, d = query.data.split("_")
 
         if action == "holiday":
-            data["holidays"].append(d)
+            if d not in data["holidays"]:
+                data["holidays"].append(d)
         else:
             data["records"][d] = {"status": action, "time": now}
 
         doc.set(data)
-
-        await send_auto_delete(update, context, f"✅ {action} set for {d}")
+        await send_msg(update, context, f"✅ {action} set for {d}")
 
     # ---------- STATS ----------
     elif query.data == "stats":
@@ -153,10 +156,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         percent = (present / total) * 100 if total else 0
 
-        await send_auto_delete(
-            update, context,
-            f"📊 {percent:.2f}%\nPresent: {present}/{total}"
-        )
+        await send_msg(update, context,
+            f"📊 {percent:.2f}%\nPresent: {present}/{total}")
 
 # ---------- MAIN ----------
 app = ApplicationBuilder().token(TOKEN).build()
@@ -164,5 +165,5 @@ app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(button))
 
-print("🔥 AttendX Firebase Running...")
+print("🔥 AttendX FINAL running...")
 app.run_polling()
