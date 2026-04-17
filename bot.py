@@ -5,15 +5,29 @@ from firebase_admin import credentials, firestore
 from datetime import datetime, date
 from calendar import monthrange
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 
-# ---------- FIREBASE ENV ----------
-firebase_key = json.loads(os.getenv("FIREBASE_KEY"))
+# ---------- FIREBASE INIT ----------
+firebase_env = os.getenv("FIREBASE_KEY")
+
+if not firebase_env:
+    raise ValueError("❌ FIREBASE_KEY not found in ENV")
+
+firebase_key = json.loads(firebase_env)
+
 cred = credentials.Certificate(firebase_key)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 TOKEN = os.getenv("BOT_TOKEN")
+
+if not TOKEN:
+    raise ValueError("❌ BOT_TOKEN not found in ENV")
 
 # ---------- UTILS ----------
 def is_sunday(d):
@@ -28,7 +42,8 @@ async def auto_delete(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_msg(update, context, text, keyboard=None):
     msg = await update.effective_chat.send_message(text, reply_markup=keyboard)
-    context.job_queue.run_once(auto_delete, 20, data=(msg.chat_id, msg.message_id))
+    if context.job_queue:
+        context.job_queue.run_once(auto_delete, 20, data=(msg.chat_id, msg.message_id))
 
 # ---------- START ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -62,14 +77,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if today in data["records"]:
             entry = data["records"][today]
-            await send_msg(update, context,
-                f"⚠️ Already submitted ({entry['status']} at {entry['time']})")
+            await send_msg(
+                update, context,
+                f"⚠️ Already submitted ({entry['status']} at {entry['time']})"
+            )
             return
 
         data["records"][today] = {"status": query.data, "time": now}
         doc.set(data)
 
-        await send_msg(update, context, f"✅ {query.data} at {now}")
+        await send_msg(update, context, f"✅ {query.data} marked at {now}")
 
     # ---------- HOLIDAY ----------
     elif query.data == "holiday_today":
@@ -101,9 +118,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 emoji = "▫️"
 
-            row.append(InlineKeyboardButton(
-                emoji + str(d), callback_data=f"day_{d_str}"
-            ))
+            row.append(
+                InlineKeyboardButton(emoji + str(d), callback_data=f"day_{d_str}")
+            )
 
             if len(row) == 7:
                 buttons.append(row)
@@ -140,6 +157,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["records"][d] = {"status": action, "time": now}
 
         doc.set(data)
+
         await send_msg(update, context, f"✅ {action} set for {d}")
 
     # ---------- STATS ----------
@@ -156,8 +174,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         percent = (present / total) * 100 if total else 0
 
-        await send_msg(update, context,
-            f"📊 {percent:.2f}%\nPresent: {present}/{total}")
+        await send_msg(
+            update, context,
+            f"📊 {percent:.2f}%\nPresent: {present}/{total}"
+        )
 
 # ---------- MAIN ----------
 app = ApplicationBuilder().token(TOKEN).build()
